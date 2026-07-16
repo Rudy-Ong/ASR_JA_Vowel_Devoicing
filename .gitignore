@@ -1,0 +1,18 @@
+# environments
+.venv/
+.env
+
+# python
+__pycache__/
+*.pyc
+
+# experiment noise
+wandb/
+*.log
+doc/results_*.csv
+
+# JSUT audio is not redistributed — download it yourself (see README)
+dataset/jsut_ver1.1/basic5000/wav/*.wav
+
+# gradio
+gradio_cached_examples/
