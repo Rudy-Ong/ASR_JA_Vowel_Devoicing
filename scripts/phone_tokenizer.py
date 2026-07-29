@@ -92,10 +92,13 @@ class JapanesePhoneTokenizer:
         return self.id2token.get(token_id, "") in DEVO_PHONES
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(
-            json.dumps({"vocab": self.vocab}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        """Write the vocab JSON; skip when unchanged so a training run doesn't
+        touch (and potentially dirty) the tracked vocab file."""
+        path = Path(path)
+        text = json.dumps({"vocab": self.vocab}, ensure_ascii=False, indent=2)
+        if path.exists() and path.read_text(encoding="utf-8") == text:
+            return
+        path.write_text(text, encoding="utf-8")
 
     @classmethod
     def from_vocab(cls, path: str | Path) -> "JapanesePhoneTokenizer":
@@ -138,7 +141,7 @@ class JapaneseRomajiRevTokenizer(JapanesePhoneTokenizer):
     encoded *inside* its syllable by capitalising the vowel letter
     (し→``shI``, く→``kU``, す→``sU``); any token carrying an upper-case letter is
     therefore a devoicing token.  ``pau`` (from an ideographic comma 、) is a
-    normal vocab token but is excluded from CER scoring by callers.
+    normal vocab token but is excluded from PER scoring by callers.
     """
 
     def devo_token_ids(self) -> list[int]:
@@ -201,7 +204,8 @@ class JapaneseRomajiRevTokenizer3(JapanesePhonemeTokenizer):
 
     Devoicing is encoded by upper-casing the vowel token, so ``I``/``U`` are the
     two devoicing token types (inherited :meth:`devo_token_ids`). ``pau`` is a
-    normal vocab token but is excluded from CER scoring by callers.
+    normal vocab token but is excluded from PER and KER scoring by callers
+    (rendered as 、 for display only).
     """
 
     @property

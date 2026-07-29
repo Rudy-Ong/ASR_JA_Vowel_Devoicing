@@ -305,10 +305,11 @@ def load_model(checkpoint_path: Path,
     # flag → False → preprocessing is unchanged.
     model.cmvn = bool(ckpt.get("cmvn", cfg.get("cmvn", False)))
     epoch   = ckpt.get("epoch", "?")
-    val_cer = ckpt.get("val_CER", "?")
+    # 'val_CER' key kept for backward compatibility with pre-rename checkpoints
+    val_per = ckpt.get("val_PER", ckpt.get("val_CER", "?"))
     devo    = ckpt.get("DEO", ckpt.get("devo_acc", "?"))
     print(f"Loaded checkpoint: {checkpoint_path.name}")
-    print(f"  epoch={epoch}  val_CER={val_cer}  DEO={devo}  cmvn={model.cmvn}  device={DEVICE}")
+    print(f"  epoch={epoch}  val_PER={val_per}  DEO={devo}  cmvn={model.cmvn}  device={DEVICE}")
     return model
 
 

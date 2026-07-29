@@ -283,8 +283,22 @@ def format_transcript(token_ids: list[int],
 
 
 # ── Load model ────────────────────────────────────────────────────────────────
+def _is_lfs_pointer(path: Path) -> bool:
+    """True if ``path`` is a git-lfs pointer stub rather than real weights."""
+    try:
+        with path.open("rb") as f:
+            return f.read(64).startswith(b"version https://git-lfs.github.com/spec/")
+    except OSError:
+        return False
+
+
 def load_model(checkpoint_path: Path,
                tokenizer: JapaneseRomajiRevTokenizer3) -> ConformerASR:
+    if _is_lfs_pointer(checkpoint_path):
+        raise RuntimeError(
+            f"{checkpoint_path.name} is a git-lfs pointer stub, not model "
+            "weights. Fetch the real file with `git lfs pull`, or train a new "
+            "one with train_r3.py.")
     ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
     cfg  = ckpt["config"]
     model = ConformerASR(
@@ -307,10 +321,12 @@ def load_model(checkpoint_path: Path,
     # flag → False → preprocessing is unchanged.
     model.cmvn = bool(ckpt.get("cmvn", cfg.get("cmvn", False)))
     epoch   = ckpt.get("epoch", "?")
-    val_cer = ckpt.get("val_CER", "?")
+    # 'val_CER'/'kana_CER' keys kept for backward compatibility with older checkpoints
+    val_per = ckpt.get("val_PER", ckpt.get("val_CER", "?"))
+    ker     = ckpt.get("KER", ckpt.get("kana_CER", "?"))
     devo    = ckpt.get("DEO", ckpt.get("devo_acc", "?"))
     print(f"Loaded checkpoint: {checkpoint_path.name}")
-    print(f"  epoch={epoch}  val_CER={val_cer}  DEO={devo}  cmvn={model.cmvn}  device={DEVICE}")
+    print(f"  epoch={epoch}  val_PER={val_per}  KER={ker}  DEO={devo}  cmvn={model.cmvn}  device={DEVICE}")
     return model
 
 
@@ -320,9 +336,12 @@ def _default_checkpoint() -> Path:
     candidates = sorted(model_dir.glob("train_phone3_*.pt"),
                         key=lambda p: p.stat().st_mtime, reverse=True)
     for p in candidates:
-        if p.exists():
+        if p.exists() and not _is_lfs_pointer(p):
             return p
-    raise FileNotFoundError(f"No train_phone3_*.pt checkpoint found in {model_dir}")
+    raise FileNotFoundError(
+        f"No usable train_phone3_*.pt checkpoint found in {model_dir}. "
+        "The shipped .pt files are git-lfs pointer stubs — fetch them with "
+        "`git lfs pull`, or train a new one with train_r3.py.")
 
 
 def _default_vocab() -> Path:

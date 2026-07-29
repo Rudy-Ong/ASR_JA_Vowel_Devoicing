@@ -26,6 +26,7 @@ import torchaudio
 import torchaudio.transforms as T
 from scripts.phone_tokenizer import JapaneseRomajiRevTokenizer3
 from scripts.stratified_sampling import load_splits
+from scripts.kana import compute_kana_error_rate
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 import libtmux
@@ -48,6 +49,20 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else
                       'mps'  if torch.backends.mps.is_available() else 'cpu')
+
+# Every batch has the same shape (MAX_FRAMES × N_MELS), so cudnn autotuning
+# pays off without re-benchmarking per batch.
+torch.backends.cudnn.benchmark = True
+
+# Optional: allow TF32 matmuls (Ampere+).  Off by default to keep numerics
+# identical to the published runs; enable with ALLOW_TF32=1.  (Conv layers
+# already use TF32 by default via cudnn — this flag only affects matmuls.)
+if os.environ.get('ALLOW_TF32', '0') == '1':
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+    print('TF32 matmul: ON (ALLOW_TF32=1)')
+else:
+    print('TF32 matmul: off (default; ALLOW_TF32=1 to enable)')
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR  = ROOT / 'dataset' / 'jsut_ver1.1' / 'basic5000'
@@ -80,6 +95,11 @@ FF_DIM       = 1024
 DROPOUT      = 0.1
 KERNEL_SIZE  = 19
 DEVO_WEIGHT  = 5.0
+
+# Optional: mask zero-padded mel frames out of the encoder self-attention.
+# Off by default so runs reproduce the published pipeline exactly; set
+# ENC_PADDING_MASK=1 to restrict attention to real frames (changes training).
+USE_ENC_PADDING_MASK = os.environ.get('ENC_PADDING_MASK', '0') == '1'
 
 # ── Stratified split config ───────────────────────────────────────────────────
 USE_STRATIFIED_SPLIT = True   # set True after: python scripts/stratified_sampling.py
@@ -250,10 +270,10 @@ class ConformerEncoder(nn.Module):
             for _ in range(n_layers)
         ])
 
-    def forward(self, x):
+    def forward(self, x, key_padding_mask=None):
         x = self.dropout(self.subsample(x))
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, key_padding_mask)
         return x
 
 
@@ -269,12 +289,13 @@ class TransformerDecoder(nn.Module):
         self.layers   = nn.TransformerDecoder(layer, num_layers=n_layers)
         self.out_proj = nn.Linear(d_model, vocab_size)
 
-    def forward(self, tgt, memory, tgt_key_padding_mask=None):
+    def forward(self, tgt, memory, tgt_key_padding_mask=None, memory_key_padding_mask=None):
         T = tgt.shape[1]
         causal_mask = torch.triu(torch.ones(T, T, device=tgt.device), diagonal=1).bool()
         x = self.pos_drop(self.embed(tgt))
         x = self.layers(x, memory, tgt_mask=causal_mask,
-                        tgt_key_padding_mask=tgt_key_padding_mask)
+                        tgt_key_padding_mask=tgt_key_padding_mask,
+                        memory_key_padding_mask=memory_key_padding_mask)
         return self.out_proj(x)
 
 
@@ -287,8 +308,9 @@ class ConformerASR(nn.Module):
         self.decoder = TransformerDecoder(vocab_size, d_model, n_heads, ff_dim,
                                           n_dec_layers, dropout)
 
-    def forward(self, mel, tgt_in, tgt_pad_mask=None):
-        return self.decoder(tgt_in, self.encoder(mel), tgt_pad_mask)
+    def forward(self, mel, tgt_in, tgt_pad_mask=None, enc_pad_mask=None):
+        return self.decoder(tgt_in, self.encoder(mel, enc_pad_mask), tgt_pad_mask,
+                            memory_key_padding_mask=enc_pad_mask)
 
 
 model = ConformerASR(
@@ -333,12 +355,16 @@ def edit_distance(a, b):
     return dp[n]
 
 
-def compute_cer(pred_ids, ref_ids):
-    """Character (syllable) Error Rate over the romaji-rev token sequences.
+def compute_per(pred_ids, ref_ids):
+    """Phone Error Rate over the phone3 romaji-rev token sequences.
 
-    ``pau`` and ``<eos>`` (plus ``<pad>``/``<sos>``) are NOT counted: they are
-    stripped from both hypothesis and reference before the edit-distance, so CER
-    measures only the spoken romaji syllables.
+    The Levenshtein distance runs over phone-level tokens (``k``, ``sh``,
+    ``cl``, ``I``/``U`` …), so this is a phone(-token) error rate — historically
+    logged as "CER" in this repo.  ``pau`` and ``<eos>`` (plus
+    ``<pad>``/``<sos>``) are NOT counted: they are stripped from both hypothesis
+    and reference before the edit-distance, so PER measures only the spoken
+    phones.  See ``scripts.kana.compute_kana_error_rate`` for the
+    character-level metric (KER, kana error rate).
     """
     special = {tokenizer.PAD_ID, tokenizer.SOS_ID, tokenizer.EOS_ID, tokenizer.pau_id}
     total_dist = total_ref = 0
@@ -427,7 +453,7 @@ def _align(ref, hyp):
     pairs; a gap (insertion / deletion) carries ``None`` on the missing side.
 
     Used by the devoicing-detection metric, which aligns on the *devoicing-folded*
-    key (I↔i, U↔u collapsed) — the same alignment CER uses — so a high-vowel slot
+    key (I↔i, U↔u collapsed) — the same alignment PER uses — so a high-vowel slot
     lines up regardless of whether it is devoiced; the devoicing decision is then
     read from the original token ids.
     """
@@ -516,18 +542,29 @@ def compute_devoicing_detection(pred_ids, ref_ids):
 
 
 # ── 7. Greedy Decode ──────────────────────────────────────────────────────────
+def _build_enc_padding_mask(mel_len) -> torch.Tensor:
+    """key_padding_mask [B, T'] (True = padded) for the ×4-subsampled encoder
+    output, built from per-utterance mel frame counts.  Inputs are always
+    padded to MAX_FRAMES, so T' = ceil(MAX_FRAMES / 4)."""
+    out_len = (MAX_FRAMES + 3) // 4
+    keep = (mel_len.to(DEVICE) + 3) // 4          # ceil(len / 4) real frames
+    return torch.arange(out_len, device=DEVICE).unsqueeze(0) >= keep.unsqueeze(1)
+
+
 @torch.no_grad()
-def greedy_decode_batch(model, mel, max_len=MAX_TOKENS):
+def greedy_decode_batch(model, mel, max_len=MAX_TOKENS, mel_len=None):
     model.eval()
     B = mel.shape[0]
     _m = model.module if isinstance(model, nn.DataParallel) else model
-    memory = _m.encoder(mel.to(DEVICE))
+    enc_mask = (_build_enc_padding_mask(mel_len)
+                if USE_ENC_PADDING_MASK and mel_len is not None else None)
+    memory = _m.encoder(mel.to(DEVICE), enc_mask)
 
     tgt      = torch.full((B, 1), tokenizer.SOS_ID, dtype=torch.long, device=DEVICE)
     finished = torch.zeros(B, dtype=torch.bool, device=DEVICE)
 
     for _ in range(max_len - 1):
-        logits   = _m.decoder(tgt, memory)
+        logits   = _m.decoder(tgt, memory, memory_key_padding_mask=enc_mask)
         next_tok = logits[:, -1, :].argmax(-1)
         next_tok = next_tok.masked_fill(finished, tokenizer.PAD_ID)
         finished |= (next_tok == tokenizer.EOS_ID)
@@ -579,6 +616,9 @@ if torch.cuda.device_count() > 1:
 else:
     print(f"Single GPU: {DEVICE}")
 
+print(f'Encoder padding mask: '
+      f'{"ON (ENC_PADDING_MASK=1)" if USE_ENC_PADDING_MASK else "off (default; ENC_PADDING_MASK=1 to enable)"}')
+
 
 # ── 9. Train & Eval Functions ─────────────────────────────────────────────────
 def train_epoch(model, loader, optimizer, scheduler, criterion, global_step=0):
@@ -594,8 +634,9 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, global_step=0):
         tgt_in  = tokens[:, :-1]
         tgt_out = tokens[:, 1:]
         pad_mask = (tgt_in == tokenizer.PAD_ID)
+        enc_mask = _build_enc_padding_mask(batch['mel_len']) if USE_ENC_PADDING_MASK else None
 
-        logits = model(mel, tgt_in, tgt_pad_mask=pad_mask)
+        logits = model(mel, tgt_in, tgt_pad_mask=pad_mask, enc_pad_mask=enc_mask)
         loss   = criterion(logits.reshape(-1, tokenizer.vocab_size), tgt_out.reshape(-1))
 
         optimizer.zero_grad()
@@ -622,20 +663,22 @@ def eval_epoch(model, loader, criterion):
         tgt_in  = tokens[:, :-1]
         tgt_out = tokens[:, 1:]
         pad_mask = (tgt_in == tokenizer.PAD_ID)
+        enc_mask = _build_enc_padding_mask(batch['mel_len']) if USE_ENC_PADDING_MASK else None
 
-        logits = model(mel, tgt_in, tgt_pad_mask=pad_mask)
+        logits = model(mel, tgt_in, tgt_pad_mask=pad_mask, enc_pad_mask=enc_mask)
         loss   = criterion(logits.reshape(-1, tokenizer.vocab_size), tgt_out.reshape(-1))
         total_loss += loss.item()
 
-        all_pred.extend(greedy_decode_batch(model, mel))
+        all_pred.extend(greedy_decode_batch(model, mel, mel_len=batch['mel_len']))
         all_ref.extend(tokens.tolist())
 
-    cer = compute_cer(all_pred, all_ref)
+    per = compute_per(all_pred, all_ref)
+    ker = compute_kana_error_rate(all_pred, all_ref, tokenizer)
     DEO, deo_correct, devo_total = compute_devoicing_deo(all_pred, all_ref)
     CCDA, ccda_correct, _        = compute_devoicing_ccda(all_pred, all_ref)
     F1, P, R, tp, fp, fn         = compute_devoicing_detection(all_pred, all_ref)
     return {
-        'loss': total_loss / len(loader), 'cer': cer,
+        'loss': total_loss / len(loader), 'per': per, 'ker': ker,
         'f1': F1, 'precision': P, 'recall': R, 'tp': tp, 'fp': fp, 'fn': fn,
         'ccda': CCDA, 'ccda_correct': ccda_correct,
         'deo': DEO, 'deo_correct': deo_correct,            # retained: logging only
@@ -679,7 +722,7 @@ def log(msg: str) -> None:
 
 # ── 11. Resume from previous checkpoint ──────────────────────────────────────
 start_epoch = 1
-best_cer    = float('inf')
+best_per    = float('inf')
 global_step = 0
 
 _resume_path = Path(RESUME_FROM) if RESUME_FROM else MODEL_DIR / f'{model_name}.pt'
@@ -694,9 +737,10 @@ if _resume_path.exists():
     if 'scheduler_state' in _ckpt:
         scheduler.load_state_dict(_ckpt['scheduler_state'])
     start_epoch = _ckpt['epoch'] + 1
-    best_cer    = float(_ckpt['val_CER'].replace('%', ''))
+    # 'val_CER' key kept for backward compatibility with pre-rename checkpoints
+    best_per    = float(_ckpt.get('val_PER', _ckpt.get('val_CER', 'inf')).replace('%', ''))
     global_step = _ckpt['epoch'] * len(train_loader)
-    log(f'Resumed from checkpoint: {_resume_path.name}  epoch={_ckpt["epoch"]} | best_CER={best_cer:.4f}%')
+    log(f'Resumed from checkpoint: {_resume_path.name}  epoch={_ckpt["epoch"]} | best_PER={best_per:.4f}%')
 elif RESUME_FROM:
     raise FileNotFoundError(f'RESUME_FROM checkpoint not found: {RESUME_FROM}')
 else:
@@ -712,12 +756,13 @@ for epoch in range(start_epoch, NUM_EPOCHS + 1):
     train_loss, global_step = train_epoch(
         model, train_loader, optimizer, scheduler, criterion, global_step)
     m = eval_epoch(model, val_loader, criterion)
-    val_cer = m['cer']
+    val_per = m['per']
 
     log(
         f'Epoch {epoch}/{NUM_EPOCHS} | '
         f'train_loss={train_loss:.4f} | val_loss={m["loss"]:.4f} | '
-        f'val_CER={val_cer:.2f}% | '
+        f'val_PER={val_per:.2f}% | '
+        f'KER={m["ker"]:.2f}% | '
         f'devoF1={m["f1"]:.2f}% (P={m["precision"]:.2f} R={m["recall"]:.2f}, '
         f'TP={m["tp"]} FP={m["fp"]} FN={m["fn"]}) | '
         f'CCDA={m["ccda"]:.2f}% ({m["ccda_correct"]}/{m["devo_total"]}) | '
@@ -727,7 +772,8 @@ for epoch in range(start_epoch, NUM_EPOCHS + 1):
     wandb.log({
         'train_loss@epoch': train_loss,
         'val_loss@epoch':   m['loss'],
-        'val_cer@epoch':    val_cer,
+        'val_per@epoch':    val_per,
+        'ker@epoch':        m['ker'],
         'devoF1@epoch':         None if math.isnan(m['f1'])        else m['f1'],
         'devo_precision@epoch': None if math.isnan(m['precision']) else m['precision'],
         'devo_recall@epoch':    None if math.isnan(m['recall'])    else m['recall'],
@@ -735,8 +781,8 @@ for epoch in range(start_epoch, NUM_EPOCHS + 1):
         'DEO@epoch':            None if math.isnan(m['deo'])       else m['deo'],
     }, step=global_step)
 
-    if val_cer < best_cer:
-        best_cer  = val_cer
+    if val_per < best_per:
+        best_per  = val_per
         best_val_result = {'epoch': epoch, **m}
         ckpt_path = MODEL_DIR / f'{model_name}.pt'
         _m_save = model.module if isinstance(model, nn.DataParallel) else model
@@ -745,7 +791,8 @@ for epoch in range(start_epoch, NUM_EPOCHS + 1):
             'model_state':      _m_save.state_dict(),
             'optimizer_state':  optimizer.state_dict(),
             'scheduler_state':  scheduler.state_dict(),
-            'val_CER':         f'{val_cer:.2f}%',
+            'val_PER':         f'{val_per:.2f}%',
+            'KER':             f'{m["ker"]:.2f}%',
             'devo_F1':         f'{m["f1"]:.2f}%',
             'devo_P':          f'{m["precision"]:.2f}%',
             'devo_R':          f'{m["recall"]:.2f}%',
@@ -778,9 +825,10 @@ if any(k.startswith('module.') for k in _state):
 _m.load_state_dict(_state)
 
 tm = eval_epoch(model, test_loader, criterion)
-test_cer = tm['cer']
+test_per = tm['per']
 print(f'\n=== Test Results ===')
-print(f'Test CER    : {test_cer:.2f}%')
+print(f'Test PER    : {test_per:.2f}%')
+print(f'Test KER    : {tm["ker"]:.2f}%')
 print(f'Devo P/R/F1 : {tm["precision"]:.2f}% / {tm["recall"]:.2f}% / {tm["f1"]:.2f}%  '
       f'(TP={tm["tp"]} FP={tm["fp"]} FN={tm["fn"]})')
 print(f'CCDA        : {tm["ccda"]:.2f}%  ({tm["ccda_correct"]}/{tm["devo_total"]})')
@@ -797,7 +845,8 @@ def _pct(x, nd):
 def _row(split, epoch, d, nd):
     return {
         'model_name': model_name, 'date': today, 'split': split, 'epoch': epoch,
-        'CER':     _pct(d['cer'], nd),
+        'PER':     _pct(d['per'], nd),
+        'KER':     _pct(d['ker'], nd),
         'devo_P':  _pct(d['precision'], nd),
         'devo_R':  _pct(d['recall'], nd),
         'devo_F1': _pct(d['f1'], nd),
@@ -814,7 +863,7 @@ if best_val_result:
     all_rows.append(_row('val', best_val_result['epoch'], best_val_result, 2))
 all_rows.append(_row('test', ckpt['epoch'], tm, 5))
 
-fieldnames = ['model_name', 'date', 'split', 'epoch', 'CER',
+fieldnames = ['model_name', 'date', 'split', 'epoch', 'PER', 'KER',
               'devo_P', 'devo_R', 'devo_F1', 'TP', 'FP', 'FN',
               'CCDA', 'CCDA_correct', 'DEO', 'DEO_correct', 'devo_total']
 write_header = not csv_path.exists()
