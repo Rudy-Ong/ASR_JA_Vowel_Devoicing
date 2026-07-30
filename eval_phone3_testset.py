@@ -6,7 +6,7 @@ the Option-B devoicing suite and emit a Markdown results table.
 
 Reuses inference_r3's decode machinery (load_model / greedy_decode_batch /
 load_mel / test-id + transcript loaders) and the train_r3 metric definitions
-(CER, slot-level Precision/Recall/F1, CCDA, DEO).
+(PER, KER, slot-level Precision/Recall/F1, CCDA, DEO).
 
 Usage:
     python eval_phone3_testset.py                 # all train_phone3_*.pt
@@ -28,9 +28,10 @@ sys.path.insert(0, str(ROOT))
 
 from inference_r3 import (
     MAX_TOKENS, load_mel, greedy_decode_batch, load_model,
-    _load_test_ids, _load_transcripts,
+    _load_test_ids, _load_transcripts, _is_lfs_pointer,
 )
 from scripts.phone_tokenizer import JapaneseRomajiRevTokenizer3
+from scripts.kana import compute_kana_error_rate
 from scripts import devoicing_eval as deval
 
 DATA_DIR = ROOT / "dataset" / "jsut_ver1.1" / "basic5000"
@@ -52,7 +53,10 @@ def _edit_distance(a, b):
     return dp[len(b)]
 
 
-def compute_cer(tok, pred_ids, ref_ids):
+def compute_per(tok, pred_ids, ref_ids):
+    """Phone Error Rate (%): edit distance over phone3 tokens (pau/special
+    stripped).  Historically reported as "CER" in this repo; the true
+    character-level metric is ``compute_kana_error_rate`` (KER)."""
     special = {tok.PAD_ID, tok.SOS_ID, tok.EOS_ID, tok.pau_id}
     dist = ref = 0
     for p, r in zip(pred_ids, ref_ids):
@@ -188,6 +192,15 @@ def main():
              sorted(MODELS.glob("train_phone3_*.pt"),
                     key=lambda p: (int(re.search(r'_bs(\d+)', p.name).group(1)),
                                    -float(re.search(r'_lr([0-9.e-]+?)_', p.name).group(1)))))
+    lfs_stubs = [c for c in ckpts if _is_lfs_pointer(c)]
+    if lfs_stubs:
+        print(f"Skipping {len(lfs_stubs)} git-lfs pointer stub(s): "
+              + ", ".join(c.name for c in lfs_stubs))
+    ckpts = [c for c in ckpts if not _is_lfs_pointer(c)]
+    if not ckpts:
+        raise SystemExit(
+            "No usable checkpoints found (only git-lfs pointer stubs). "
+            "Run `git lfs pull`, or train with train_r3.py.")
     groups  = tok.vowel_groups()
     special = {tok.PAD_ID, tok.SOS_ID, tok.EOS_ID}
 
@@ -196,13 +209,14 @@ def main():
         print(f"\n=== {ck.name} ===")
         model = load_model(ck, tok)
         pred, ref = decode_split(model, tok, test_ids, args.batch_size)
-        cer = compute_cer(tok, pred, ref)
+        per = compute_per(tok, pred, ref)
+        ker = compute_kana_error_rate(pred, ref, tok)
         f1, P, R, tp, fp, fn = compute_detection(tok, pred, ref)
         ccda, _, devo_total = compute_ccda(tok, pred, ref)
         deo, _, _ = compute_deo(tok, pred, ref)
-        print(f"  CER={cer:.2f}  P={P:.2f} R={R:.2f} F1={f1:.2f}  "
+        print(f"  PER={per:.2f}  KER={ker:.2f}  P={P:.2f} R={R:.2f} F1={f1:.2f}  "
               f"CCDA={ccda:.2f} DEO={deo:.2f}  (TP={tp} FP={fp} FN={fn}/{devo_total})")
-        rows.append((_cfg_label(ck.name), cer, P, R, f1, ccda, deo))
+        rows.append((_cfg_label(ck.name), per, ker, P, R, f1, ccda, deo))
 
         # ── two-class (devoiced vs voiced) detection confusion matrix, per vowel i/u ──
         if not args.no_confusion:
@@ -236,12 +250,12 @@ def main():
         print(f"\nConfusion CSV → {cm_csv}")
 
     # ── Markdown table (header separator "| === |" per request) ──
-    head = ("| model config | CER ↓ (%) | Precision ↑ (%) | Recall ↑ (%) | "
+    head = ("| model config | PER ↓ (%) | KER ↓ (%) | Precision ↑ (%) | Recall ↑ (%) | "
             "F1 ↑ (%) | CCDA ↑ (%) | DEO ↑ (%) |")
     lines = ["# Phone-level3 Romaji-rev — Devoicing Detection (stratified, test split)",
              "", head, "| === |"]
-    for cfg, cer, P, R, f1, ccda, deo in rows:
-        lines.append(f"| {cfg} | {cer:.2f} | {P:.2f} | {R:.2f} | {f1:.2f} | {ccda:.2f} | {deo:.2f} |")
+    for cfg, per, ker, P, R, f1, ccda, deo in rows:
+        lines.append(f"| {cfg} | {per:.2f} | {ker:.2f} | {P:.2f} | {R:.2f} | {f1:.2f} | {ccda:.2f} | {deo:.2f} |")
     table = "\n".join(lines) + "\n"
     args.out.write_text(table, encoding="utf-8")
     print("\n" + table)

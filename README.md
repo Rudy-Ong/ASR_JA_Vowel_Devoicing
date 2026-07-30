@@ -7,7 +7,12 @@ are upper-cased (`s U k i` → し is devoiced), so recognition and devoicing
 detection happen in a single pass.
 
 Best configuration (see [doc/results.md](doc/results.md)): bs8 lr1e-3 —
-**CER 2.35 %**, devoicing detection **F1 97.23 %**.
+**PER 2.35 %** (phone error rate; reported as "CER" before 2026-07-29),
+devoicing detection **F1 97.23 %**. Character-level accuracy is reported
+separately as **KER** (kana error rate — a character error rate over the
+kana rendering of the phone3 output, punctuation excluded; see
+`scripts/kana.py`, conventions follow
+[nyosegawa/hiragana-asr](https://github.com/nyosegawa/hiragana-asr)).
 
 ## Repository layout
 
@@ -80,8 +85,12 @@ Writes `dataset/.../transcript_phone3_rev.txt` and
 > corrections (5 utterances, e.g. BASIC5000_0047) on top of the rule-based
 > output. Re-running the script overwrites them — use
 > `git checkout dataset/.../transcript_phone3_rev.txt` to restore, or pass an
-> alternative `--dst`. The stratified split manifest can be
-rebuilt with `python scripts/stratified_sampling.py` (needs the wavs).
+> alternative `--dst`. The stratified split manifest can **not** be rebuilt
+> exactly: `scripts/stratified_sampling.py` also needs `transcript_phone.txt`
+> and `transcript_romaji.txt` (from the older r1 pipeline), which are not
+> committed, and regenerating from the phone3 transcripts would produce a
+> *different* split. Treat the committed `stratified_manifest.csv` as
+> authoritative for reproducing the published numbers.
 
 ### 2. Training
 
@@ -111,7 +120,7 @@ Without `--checkpoint` the newest `models/train_phone3_*.pt` is used.
 ### 4. Test-set evaluation over all checkpoints
 
 ```bash
-python eval_phone3_testset.py            # per-checkpoint CER + devoicing P/R/F1
+python eval_phone3_testset.py            # per-checkpoint PER + KER + devoicing P/R/F1
 ```
 
 Confusion-matrix PNGs go to `img/`, tables to `doc/`.
