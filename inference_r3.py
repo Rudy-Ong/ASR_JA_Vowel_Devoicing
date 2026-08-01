@@ -321,19 +321,28 @@ def load_model(checkpoint_path: Path,
     # flag → False → preprocessing is unchanged.
     model.cmvn = bool(ckpt.get("cmvn", cfg.get("cmvn", False)))
     epoch   = ckpt.get("epoch", "?")
-    # 'val_CER'/'kana_CER' keys kept for backward compatibility with older checkpoints
-    val_per = ckpt.get("val_PER", ckpt.get("val_CER", "?"))
-    ker     = ckpt.get("KER", ckpt.get("kana_CER", "?"))
-    devo    = ckpt.get("DEO", ckpt.get("devo_acc", "?"))
     print(f"Loaded checkpoint: {checkpoint_path.name}")
-    print(f"  epoch={epoch}  val_PER={val_per}  KER={ker}  DEO={devo}  cmvn={model.cmvn}  device={DEVICE}")
+    if "test_PER" in ckpt:
+        # Test-split metrics baked in post-hoc (e.g. via eval_phone3_testset.py)
+        # for a published checkpoint — prefer these over the training-time val split.
+        per, ker, extra_label, extra = (
+            ckpt["test_PER"], ckpt.get("test_KER", "?"), "CCDA", ckpt.get("test_CCDA", "?"))
+        per_label = "test_PER"
+    else:
+        # 'val_CER'/'kana_CER' keys kept for backward compatibility with older checkpoints
+        per = ckpt.get("val_PER", ckpt.get("val_CER", "?"))
+        ker = ckpt.get("KER", ckpt.get("kana_CER", "?"))
+        extra_label, extra = "DEO", ckpt.get("DEO", ckpt.get("devo_acc", "?"))
+        per_label = "val_PER"
+    print(f"  epoch={epoch}  {per_label}={per}  KER={ker}  {extra_label}={extra}  "
+          f"cmvn={model.cmvn}  device={DEVICE}")
     return model
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def _default_checkpoint() -> Path:
     model_dir = ROOT / "models"
-    candidates = sorted(model_dir.glob("train_phone3_*.pt"),
+    candidates = sorted(model_dir.glob("*.pt"),
                         key=lambda p: p.stat().st_mtime, reverse=True)
     for p in candidates:
         if p.exists() and not _is_lfs_pointer(p):
@@ -374,6 +383,19 @@ def _load_transcripts(data_dir: Path) -> dict[str, str]:
     return transcripts
 
 
+def _load_utf8_transcripts(data_dir: Path) -> dict[str, str]:
+    """Read transcript_utf8_rev.txt → {utt_id: original JSUT surface text}, if present."""
+    path = data_dir / "transcript_utf8_rev.txt"
+    if not path.is_file():
+        return {}
+    transcripts: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if ":" in line:
+            utt, txt = line.split(":", 1)
+            transcripts[utt.strip()] = txt.strip()
+    return transcripts
+
+
 def _load_all_ids(transcripts: dict[str, str], wav_dir: Path) -> list[str]:
     """Return every utt_id in the corpus (≈5000) that has a matching WAV, sorted."""
     return sorted(u for u in transcripts if (wav_dir / f"{u}.wav").exists())
@@ -382,14 +404,8 @@ def _load_all_ids(transcripts: dict[str, str], wav_dir: Path) -> list[str]:
 def _run_eval(model: ConformerASR, tokenizer: JapaneseRomajiRevTokenizer3,
               transcripts: dict[str, str], utt_ids: list[str], wav_dir: Path,
               model_name: str, split: str, out_img: Path, out_csv: Path,
-              dual_img: Path | None = None, dual_csv: Path | None = None,
               batch_size: int = 16) -> None:
-    """Decode ``utt_ids`` and build devoiced-vowel confusion matrices for one split.
-
-    Always writes the alignment-based matrix (``out_img``/``out_csv``). When
-    ``dual_img``/``dual_csv`` are given it additionally writes a matrix whose TP
-    requires the CCDA context-match criterion.
-    """
+    """Decode ``utt_ids`` and build the devoiced-vowel confusion matrix for one split."""
     print(f"Evaluating {len(utt_ids)} {split} utterances ...")
 
     special = {tokenizer.PAD_ID, tokenizer.SOS_ID, tokenizer.EOS_ID}
@@ -416,37 +432,24 @@ def _run_eval(model: ConformerASR, tokenizer: JapaneseRomajiRevTokenizer3,
     print(f"\nConfusion CSV : {csv_path}")
     print(f"Confusion plot: {img_path}")
 
-    if dual_img is not None and dual_csv is not None:
-        ccda_stats = deval.compute_vowel_confusion_ccda(
-            all_pred, all_ref, special, groups, eos_id=tokenizer.EOS_ID)
-        print("\n── CCDA-scored confusion ──")
-        deval.print_confusion(ccda_stats)
-        dcsv = deval.write_confusion_csv(ccda_stats, dual_csv,
-                                         model_name=model_name, split=split)
-        dimg = deval.plot_confusion(
-            ccda_stats, dual_img,
-            title=f"Devoiced-vowel confusion (CCDA-scored TP) — {model_name} ({split})")
-        print(f"CCDA confusion CSV : {dcsv}")
-        print(f"CCDA confusion plot: {dimg}")
-
 
 def evaluate(model: ConformerASR, tokenizer: JapaneseRomajiRevTokenizer3,
              data_dir: Path, wav_dir: Path, model_name: str, scope: str,
              out_img: Path | None = None, out_csv: Path | None = None,
              batch_size: int = 16) -> None:
-    """Run inference and build devoiced-vowel confusion matrices for ``scope``.
+    """Run inference and build the devoiced-vowel confusion matrix for ``scope``.
 
     ``scope`` is one of ``test`` (stratified test split, ≈500 utts),
     ``corpus`` (all utterances, ≈5000), or ``both``.
     """
     img_dir = ROOT / "img"
     csv_dir = ROOT / "doc"
-    # split → (alignment-based stem, CCDA stem, utt-id loader)
+    # split → (stem, utt-id loader)
     plans = {
-        "test":   ("cm_vw_phone3_test_set", "cm_vw_phone3_test",
+        "test":   ("cm_vw_phone3_test_set",
                    lambda t: [u for u in _load_test_ids(data_dir, wav_dir)
                               if u in t and (wav_dir / f"{u}.wav").exists()]),
-        "corpus": ("cm_vw_phone3_corpus", "cm_vw_phone3_corpus_ccda",
+        "corpus": ("cm_vw_phone3_corpus",
                    lambda t: _load_all_ids(t, wav_dir)),
     }
     splits = ["test", "corpus"] if scope == "both" else [scope]
@@ -457,14 +460,12 @@ def evaluate(model: ConformerASR, tokenizer: JapaneseRomajiRevTokenizer3,
 
     transcripts = _load_transcripts(data_dir)
     for split in splits:
-        stem, dual_stem, id_loader = plans[split]
+        stem, id_loader = plans[split]
         utt_ids = id_loader(transcripts)
         png = out_img if (out_img and scope != "both") else img_dir / f"{stem}.png"
         csv = out_csv if (out_csv and scope != "both") else csv_dir / f"{stem}.csv"
-        dual_png = img_dir / f"{dual_stem}.png"
-        dual_csv = csv_dir / f"{dual_stem}.csv"
         _run_eval(model, tokenizer, transcripts, utt_ids, wav_dir,
-                  model_name, split, png, csv, dual_png, dual_csv, batch_size)
+                  model_name, split, png, csv, batch_size)
 
 
 def main():
@@ -519,15 +520,24 @@ def main():
     if not wav_paths:
         parser.error("Provide at least one WAV file, --dir <directory>, or --eval")
 
+    utf8_transcripts = _load_utf8_transcripts(args.data_dir)
+
     print()
     for wav_path in wav_paths:
         if not wav_path.exists():
             print(f"[SKIP] {wav_path}  (file not found)")
             continue
         transcript, contexts = transcribe(wav_path, model, tokenizer)
+        ground_truth = utf8_transcripts.get(wav_path.stem)
+        if ground_truth:
+            print("Transcript")
+            print(f"{wav_path.stem}: {ground_truth}")
+            print()
+            print("Prediction")
         print(f"{wav_path.stem}: {transcript}")
         if contexts:
-            print(f"  devoicing C1·[V]·C2: {', '.join(contexts)}")
+            print(f"devoicing C1·[V]·C2: {', '.join(contexts)}")
+        print()
 
 
 if __name__ == "__main__":

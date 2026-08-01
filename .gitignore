@@ -10,15 +10,23 @@ __pycache__/
 wandb/
 *.log
 doc/results_*.csv
+*.csv
+*.json
 
 # JSUT audio is not redistributed — download it yourself (see README)
 dataset/jsut_ver1.1/basic5000/wav/*.wav
 # local symlink to the wav dir (machine-specific path, not shared)
 dataset/jsut_ver1.1/basic5000/wav
 
+# superseded transcript/checkpoint/doc backups kept locally for reference only
+dataset/jsut_ver1.1/archive/
+models/archive/
+doc/archive/
+
 # local training checkpoints (git-lfs isn't set up on every machine; the
-# two published checkpoints are already tracked in git and unaffected)
+# published checkpoint is already tracked in git and unaffected)
 models/*.pt
 
 # gradio
 gradio_cached_examples/
+.gradio/

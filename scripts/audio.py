@@ -2,11 +2,6 @@
 scripts/audio.py
 ----------------------
 F0 (pitch) and RMS (intensity) feature extraction for the Gradio demos.
-
-Recovered from the (now-removed) ``pitch_accent_viz.audio`` module — only the
-two functions the demos actually use (``extract_pitch`` / ``rms_energy``) plus
-their shared sanitizer. ``extract_pitch`` uses Praat via parselmouth;
-``rms_energy`` uses librosa.
 """
 from __future__ import annotations
 

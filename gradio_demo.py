@@ -50,8 +50,10 @@ from scripts.phone_tokenizer import JapaneseRomajiRevTokenizer3
 
 MODEL_DIR = ROOT / "models"
 VOCAB_PATH = ROOT / "doc" / "tokenizer_romaji_rev_vocab.json"
-# Checkpoints produced by a phone3 trainer (transcript_phone3_rev.txt).
-CKPT_GLOB = "train_phone3_*.pt"
+# Checkpoints produced by a phone3 trainer (transcript_phone3_rev.txt). Matches
+# both auto-generated training-run names (train_phone3_<stamp>_...) and
+# manually-published stable names (model_bs{BS}_lr{LR}_dw{DW}.pt).
+CKPT_GLOB = "*.pt"
 
 # Cache of {checkpoint_path: (model, tokenizer)}
 _CACHE: dict[str, tuple] = {}

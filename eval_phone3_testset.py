@@ -168,13 +168,18 @@ def _cfg_label(name: str) -> str:
     lr = re.search(r"_lr([0-9.e-]+?)_", name)
     lr_v = float(lr.group(1)) if lr else 0.0
     lr_s = f"{lr_v:.0e}".replace("e-0", "e-")              # 0.001 → 1e-3
-    return f"Batch_Size: {bs.group(1) if bs else '?'}; Learning_Rate: {lr_s};"
+    return f"BS: {bs.group(1) if bs else '?'}; LR: {lr_s}"
+
+
+def _cfg_dw(name: str) -> float | None:
+    dw = re.search(r"_dw([0-9.]+)(?:_|\.pt)", name)
+    return float(dw.group(1)) if dw else None
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", type=Path, default=None,
-                    help="Single checkpoint; default = all train_phone3_*.pt")
+                    help="Single checkpoint; default = all models/*.pt")
     ap.add_argument("--out", type=Path,
                     default=ROOT / "doc" / "phone3_detection_table.md")
     ap.add_argument("--batch-size", type=int, default=16)
@@ -189,9 +194,10 @@ def main():
     print(f"Vocab {tok.vocab_size} | test utts {len(test_ids)}")
 
     ckpts = ([args.checkpoint] if args.checkpoint else
-             sorted(MODELS.glob("train_phone3_*.pt"),
+             sorted(MODELS.glob("*.pt"),
                     key=lambda p: (int(re.search(r'_bs(\d+)', p.name).group(1)),
-                                   -float(re.search(r'_lr([0-9.e-]+?)_', p.name).group(1)))))
+                                   -float(re.search(r'_lr([0-9.e-]+?)_', p.name).group(1)),
+                                   _cfg_dw(p.name) if _cfg_dw(p.name) is not None else -1.0)))
     lfs_stubs = [c for c in ckpts if _is_lfs_pointer(c)]
     if lfs_stubs:
         print(f"Skipping {len(lfs_stubs)} git-lfs pointer stub(s): "
@@ -216,14 +222,14 @@ def main():
         deo, _, _ = compute_deo(tok, pred, ref)
         print(f"  PER={per:.2f}  KER={ker:.2f}  P={P:.2f} R={R:.2f} F1={f1:.2f}  "
               f"CCDA={ccda:.2f} DEO={deo:.2f}  (TP={tp} FP={fp} FN={fn}/{devo_total})")
-        rows.append((_cfg_label(ck.name), per, ker, P, R, f1, ccda, deo))
+        rows.append((_cfg_label(ck.name), _cfg_dw(ck.name), per, ker, P, R, f1, ccda, deo))
 
         # ── two-class (devoiced vs voiced) detection confusion matrix, per vowel i/u ──
         if not args.no_confusion:
             stats = deval.compute_vowel_confusion(pred, ref, special, groups)
             deval.print_confusion(stats)
             bs = re.search(r"_bs(\d+)", ck.name).group(1)
-            lr_s = _cfg_label(ck.name).split("Learning_Rate: ")[1].rstrip(";")
+            lr_s = _cfg_label(ck.name).split("LR: ")[1]
             png = deval.plot_confusion(
                 stats, IMG_DIR / f"cm_vw_phone3_bs{bs}_lr{lr_s}.png",
                 title=f"Devoiced-vowel detection (i / u) — {ck.stem}")
@@ -249,13 +255,30 @@ def main():
             w.writerows(cm_rows)
         print(f"\nConfusion CSV → {cm_csv}")
 
-    # ── Markdown table (header separator "| === |" per request) ──
-    head = ("| model config | PER ↓ (%) | KER ↓ (%) | Precision ↑ (%) | Recall ↑ (%) | "
-            "F1 ↑ (%) | CCDA ↑ (%) | DEO ↑ (%) |")
+    # ── Markdown table: one row per (bs, lr) config, DW variants combined "v1 / v2" ──
+    metric_names = ["PER ↓ (%)", "KER ↓ (%)", "Precision ↑ (%)", "Recall ↑ (%)",
+                    "F1 ↑ (%)", "CCDA ↑ (%)", "DEO ↑ (%)"]
+    by_cfg: dict[str, dict[float | None, tuple]] = {}
+    for cfg, dw, *metrics in rows:
+        by_cfg.setdefault(cfg, {})[dw] = tuple(metrics)
+    dws = sorted({dw for _, dw, *_ in rows if dw is not None})
+
+    if dws:
+        dw_suffix = " / ".join(f"DW{dw:g}" for dw in dws)
+        cols = [f"{m} {dw_suffix}" for m in metric_names]
+    else:
+        dws = [None]
+        cols = metric_names
+
+    head = "| model config | " + " | ".join(cols) + " |"
     lines = ["# Phone-level3 Romaji-rev — Devoicing Detection (stratified, test split)",
              "", head, "| === |"]
-    for cfg, per, ker, P, R, f1, ccda, deo in rows:
-        lines.append(f"| {cfg} | {per:.2f} | {ker:.2f} | {P:.2f} | {R:.2f} | {f1:.2f} | {ccda:.2f} | {deo:.2f} |")
+    for cfg, variants in by_cfg.items():
+        cells = []
+        for i in range(len(metric_names)):
+            cells.append(" / ".join(
+                f"{variants[dw][i]:.2f}" if dw in variants else "—" for dw in dws))
+        lines.append(f"| {cfg} | " + " | ".join(cells) + " |")
     table = "\n".join(lines) + "\n"
     args.out.write_text(table, encoding="utf-8")
     print("\n" + table)

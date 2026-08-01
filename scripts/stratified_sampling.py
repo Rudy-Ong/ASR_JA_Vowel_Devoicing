@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import wave as _wave
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedShuffleSplit
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 SEED             = 42
@@ -79,20 +83,17 @@ def build_manifest(
 ) -> pd.DataFrame:
     """Compute stratified split and return a full metadata DataFrame.
 
-    Columns: utt_id, wav_path, phone_len, romaji_len, devo_count,
+    Columns: utt_id, wav_path, phone_len, devo_count,
              audio_dur_s, strata_group, split
     """
     # 1. Locate phone transcript (primary stratification key)
-    phone_path = data_dir / 'transcript_phone.txt'
-    if not phone_path.exists():
-        phone_path = data_dir / 'transcript_phoneme.txt'
+    phone_path = data_dir / 'transcript_phone3_rev.txt'
     if not phone_path.exists():
         raise FileNotFoundError(
             f"Phone transcript not found in {data_dir}\n"
-            "Expected: transcript_phone.txt or transcript_phoneme.txt"
+            "Expected: transcript_phone3_rev.txt"
         )
     phone_raw  = _parse_transcript(phone_path)
-    romaji_raw = _parse_transcript(data_dir / 'transcript_romaji.txt')
 
     # 2. Filter to utterances that have a matching WAV file
     all_ids = sorted(k for k in phone_raw if (wav_dir / f'{k}.wav').exists())
@@ -102,7 +103,6 @@ def build_manifest(
 
     # 3. Compute transcript token lengths (space-separated tokens)
     phone_lens  = np.array([len(phone_raw[k].split())          for k in all_ids])
-    romaji_lens = np.array([len(romaji_raw.get(k, '').split()) for k in all_ids])
 
     # 4. Count devoiced tokens per utterance (IPA combining ring below U+0325)
     devo_counts = np.array([
@@ -147,7 +147,6 @@ def build_manifest(
         'utt_id':       all_ids,
         'wav_path':     wav_paths,
         'phone_len':    phone_lens,
-        'romaji_len':   romaji_lens,
         'devo_count':   devo_counts,
         'audio_dur_s':  audio_durs,
         'strata_group': strata,
@@ -244,111 +243,185 @@ def print_report(df: pd.DataFrame) -> None:
 
 
 # ── Optional plot ─────────────────────────────────────────────────────────────
-def plot_distributions(df: pd.DataFrame, save_path: Path | None = None) -> None:
-    """Three-panel histogram: phone length, audio duration, devoiced token count.
+# Sized for a single column of a two-column A4 paper (column width ≈ 85 mm /
+# 3.35in, e.g. IEICE/IPSJ/ASJ-style proceedings) — each chart is meant to be
+# placed at native size (or \columnwidth) without further shrinking, so text
+# is set to the point size it should read at in print, not scaled up for an
+# on-screen preview.
+_FIG_W_IN, _FIG_H_IN = 3.35, 2.7
+_PLOT_DPI    = 300
+_FONT_TITLE  = 9
+_FONT_LABEL  = 8.5
+_FONT_TICK   = 7.5
+_FONT_LEGEND = 7
 
-    All bars colour-coded by strata group.  Saved to img/ by default.
-    """
+# Categorical palette: fixed-order, colour-vision-deficiency-safe hues
+# (blue / orange / aqua / yellow) for the 4 strata groups.
+_COLOURS = {1: '#2a78d6', 2: '#eb6834', 3: '#1baf7a', 4: '#eda100'}
+# Q1/Q2/Q3 quartile-line colours, each its own legend entry (navy/orange/green).
+_Q_LINE_COLOURS = {'Q1': 'navy', 'Q2': 'darkorange', 'Q3': 'darkgreen'}
+
+_CJK_FONT_PATH = '/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc'
+_cjk_font_ready = False
+
+
+def _ensure_cjk_font() -> None:
+    """Register the Noto CJK font so Japanese labels don't render as tofu
+    boxes — matplotlib's default (DejaVu Sans) has no CJK glyphs. Also pins
+    the Agg backend for headless rendering. Must run before pyplot is first
+    imported, so call this before ``import matplotlib.pyplot``."""
+    global _cjk_font_ready
+    if _cjk_font_ready:
+        return
+    import matplotlib
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+    if Path(_CJK_FONT_PATH).exists():
+        font_manager.fontManager.addfont(_CJK_FONT_PATH)
+        cjk_font = font_manager.FontProperties(fname=_CJK_FONT_PATH).get_name()
+        plt.rcParams['font.family'] = [cjk_font, 'DejaVu Sans']
+    _cjk_font_ready = True
 
-    COLOURS = {1: '#4C72B0', 2: '#DD8452', 3: '#55A868', 4: '#C44E52'}
+
+def _strata_labels(df: pd.DataFrame) -> dict[int, str]:
+    """Japanese strata-group legend labels, bucketed by phone-token quartile."""
     pq1 = df['phone_len'].quantile(0.25)
     pq2 = df['phone_len'].quantile(0.50)
     pq3 = df['phone_len'].quantile(0.75)
-    LABELS = {
-        1: f'G1 short  (<=Q1={pq1:.0f})',
-        2: f'G2 med-sh (<=Q2={pq2:.0f})',
-        3: f'G3 med-lg (<=Q3={pq3:.0f})',
-        4: f'G4 long   (>Q3={pq3:.0f})',
+    return {
+        1: f'G1: 短い（音素数≤{pq1:.0f}）',
+        2: f'G2: 中短（音素数≤{pq2:.0f}）',
+        3: f'G3: 中長（音素数≤{pq3:.0f}）',
+        4: f'G4: 長い（音素数>{pq3:.0f}）',
     }
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(19, 5))
 
-    # ── Panel 1: phone token length ──
-    bins1 = np.arange(10, 215, 5)
+def _apply_paper_style(ax: 'Axes', title: str, xlabel: str, ylabel: str) -> None:
+    ax.set_title(title, fontsize=_FONT_TITLE)
+    ax.set_xlabel(xlabel, fontsize=_FONT_LABEL)
+    ax.set_ylabel(ylabel, fontsize=_FONT_LABEL)
+    ax.tick_params(axis='both', labelsize=_FONT_TICK)
+
+
+def _legend_groups_then_quartiles(ax: 'Axes') -> None:
+    """One combined legend, strata-group patches (G1-G4) before quartile
+    lines (Q1-Q3) — matplotlib's default handle order puts ax.bar()
+    containers after ax.axvline() lines regardless of draw order, which
+    would otherwise put Q1-Q3 first."""
+    handles, labels = ax.get_legend_handles_labels()
+    pairs = sorted(zip(labels, handles), key=lambda hl: hl[0].startswith('Q'))
+    labels, handles = zip(*pairs)
+    ax.legend(handles, labels, fontsize=_FONT_LEGEND, loc='upper right')
+
+
+def _mark_quartiles(ax: 'Axes', q1: float, q2: float, q3: float, fmt: str) -> None:
+    """Draw dashed quartile lines, each its own colour + legend entry
+    (navy/orange/green), combined into the same legend as the strata-group
+    patches — matching img/stratified_distribution_2_plot.png's style."""
+    for name, q in (('Q1', q1), ('Q2', q2), ('Q3', q3)):
+        ax.axvline(q, color=_Q_LINE_COLOURS[name], ls='--', lw=1.2,
+                   label=f'{name}={q:{fmt}}')
+
+
+def plot_phone_length(df: pd.DataFrame, save_path: Path) -> None:
+    """発話あたりの音素トークン数の分布 (strata-coloured histogram)."""
+    _ensure_cjk_font()
+    import matplotlib.pyplot as plt
+
+    labels = _strata_labels(df)
+    pq1, pq2, pq3 = (df['phone_len'].quantile(q) for q in (0.25, 0.50, 0.75))
+
+    fig, ax = plt.subplots(figsize=(_FIG_W_IN, _FIG_H_IN))
+    bins = np.arange(10, 215, 5)
     for g in [1, 2, 3, 4]:
-        ax1.hist(
+        ax.hist(
             df[df['strata_group'] == g]['phone_len'].values,
-            bins=bins1, color=COLOURS[g], alpha=0.85,
-            label=LABELS[g], edgecolor='white', linewidth=0.3,
+            bins=bins, color=_COLOURS[g], alpha=0.85,
+            label=labels[g], edgecolor='white', linewidth=0.3,
         )
-    ax1.axvline(pq1, color='navy',       ls='--', lw=1.5, label=f'Q1={pq1:.0f}')
-    ax1.axvline(pq2, color='darkorange', ls='--', lw=1.5, label=f'Q2={pq2:.0f}')
-    ax1.axvline(pq3, color='darkgreen',  ls='--', lw=1.5, label=f'Q3={pq3:.0f}')
-    ax1.set_title('Phone Token Length per Utterance')
-    ax1.set_xlabel('Number of phone tokens')
-    ax1.set_ylabel('Count (utterances)')
-    ax1.legend(fontsize=8)
+    _mark_quartiles(ax, pq1, pq2, pq3, '.0f')
+    _apply_paper_style(ax, '発話あたりの音素トークン数の分布', '音素トークン数', '発話数')
+    _legend_groups_then_quartiles(ax)
 
-    # ── Panel 2: audio duration (stacked by strata) ──
-    bins2    = np.arange(1.0, 18.0, 0.5)
-    bin_ctrs = (bins2[:-1] + bins2[1:]) / 2
-    bottoms  = np.zeros(len(bin_ctrs))
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=_PLOT_DPI, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Plot saved → {save_path}')
+
+
+def plot_audio_duration(df: pd.DataFrame, save_path: Path) -> None:
+    """発話あたりの音声長の分布 (strata-coloured, stacked histogram)."""
+    _ensure_cjk_font()
+    import matplotlib.pyplot as plt
+
+    labels = _strata_labels(df)
+    dq1, dq2, dq3 = (df['audio_dur_s'].quantile(q) for q in (0.25, 0.50, 0.75))
+
+    fig, ax = plt.subplots(figsize=(_FIG_W_IN, _FIG_H_IN))
+    bins    = np.arange(1.0, 18.0, 0.5)
+    ctrs    = (bins[:-1] + bins[1:]) / 2
+    bottoms = np.zeros(len(ctrs))
     for g in [1, 2, 3, 4]:
-        counts, _ = np.histogram(
-            df[df['strata_group'] == g]['audio_dur_s'].values, bins=bins2
-        )
-        ax2.bar(bin_ctrs, counts, width=0.5, bottom=bottoms,
-                color=COLOURS[g], alpha=0.85, label=LABELS[g],
-                edgecolor='white', linewidth=0.3)
+        counts, _ = np.histogram(df[df['strata_group'] == g]['audio_dur_s'].values, bins=bins)
+        ax.bar(ctrs, counts, width=0.5, bottom=bottoms, color=_COLOURS[g], alpha=0.85,
+               label=labels[g], edgecolor='white', linewidth=0.3)
         bottoms += counts
-    dq1 = df['audio_dur_s'].quantile(0.25)
-    dq2 = df['audio_dur_s'].quantile(0.50)
-    dq3 = df['audio_dur_s'].quantile(0.75)
-    ax2.axvline(dq1, color='navy',       ls='--', lw=1.5, label=f'Q1={dq1:.2f}s')
-    ax2.axvline(dq2, color='darkorange', ls='--', lw=1.5, label=f'Q2={dq2:.2f}s')
-    ax2.axvline(dq3, color='darkgreen',  ls='--', lw=1.5, label=f'Q3={dq3:.2f}s')
-    ax2.set_title('Audio Duration per Utterance\n(bars coloured by phone-length strata)')
-    ax2.set_xlabel('Duration (seconds)')
-    ax2.set_ylabel('Count (utterances)')
-    ax2.legend(fontsize=8)
+    _mark_quartiles(ax, dq1, dq2, dq3, '.2f')
+    _apply_paper_style(ax, '発話あたりの音声長の分布', '音声長（s）', '発話数')
+    _legend_groups_then_quartiles(ax)
 
-    # ── Panel 3: devoiced token count (stacked by strata) ──
-    dmax  = int(df['devo_count'].max())
-    bins3 = np.arange(-0.5, dmax + 1.5, 1)
-    bin_ctrs3 = np.arange(0, dmax + 1)
-    bottoms3  = np.zeros(len(bin_ctrs3))
-    for g in [1, 2, 3, 4]:
-        counts, _ = np.histogram(
-            df[df['strata_group'] == g]['devo_count'].values, bins=bins3
-        )
-        ax3.bar(bin_ctrs3, counts, width=0.8, bottom=bottoms3,
-                color=COLOURS[g], alpha=0.85, label=LABELS[g],
-                edgecolor='white', linewidth=0.3)
-        bottoms3 += counts
-    dv   = df['devo_count']
-    dvq1 = dv.quantile(0.25)
-    dvq2 = dv.quantile(0.50)
-    dvq3 = dv.quantile(0.75)
-    ax3.axvline(dvq1, color='navy',       ls='--', lw=1.5, label=f'Q1={dvq1:.1f}')
-    ax3.axvline(dvq2, color='darkorange', ls='--', lw=1.5, label=f'Q2={dvq2:.1f}')
-    ax3.axvline(dvq3, color='darkgreen',  ls='--', lw=1.5, label=f'Q3={dvq3:.1f}')
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=_PLOT_DPI, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Plot saved → {save_path}')
+
+
+def plot_devoicing_count(df: pd.DataFrame, save_path: Path) -> None:
+    """発話あたりの無声化トークン数の分布 (strata-coloured, stacked histogram)."""
+    _ensure_cjk_font()
+    import matplotlib.pyplot as plt
+
+    labels = _strata_labels(df)
+    dv = df['devo_count']
+    dvq1, dvq2, dvq3 = (dv.quantile(q) for q in (0.25, 0.50, 0.75))
     zero_pct = (dv == 0).mean() * 100
-    ax3.set_title(
-        f'Devoiced Token Count per Utterance\n'
-        f'(zero-devo: {zero_pct:.1f}% of utterances)'
-    )
-    ax3.set_xlabel('Number of devoiced tokens')
-    ax3.set_ylabel('Count (utterances)')
-    ax3.legend(fontsize=8)
 
-    r_ph_dur = float(np.corrcoef(df['phone_len'].values, df['audio_dur_s'].values)[0, 1])
-    r_ph_dv  = float(np.corrcoef(df['phone_len'].values, df['devo_count'].values)[0, 1])
-    fig.suptitle(
-        f'JSUT basic5000  —  N={len(df):,}\n'
-        f'Phone: mean={df["phone_len"].mean():.1f} tokens  '
-        f'|  Audio: mean={df["audio_dur_s"].mean():.2f}s  '
-        f'|  Devo: mean={df["devo_count"].mean():.2f} tokens/utt  '
-        f'|  r(len,dur)={r_ph_dur:.3f}  r(len,devo)={r_ph_dv:.3f}',
-        fontsize=10,
+    fig, ax = plt.subplots(figsize=(_FIG_W_IN, _FIG_H_IN))
+    dmax    = int(dv.max())
+    bins    = np.arange(-0.5, dmax + 1.5, 1)
+    ctrs    = np.arange(0, dmax + 1)
+    bottoms = np.zeros(len(ctrs))
+    for g in [1, 2, 3, 4]:
+        counts, _ = np.histogram(df[df['strata_group'] == g]['devo_count'].values, bins=bins)
+        ax.bar(ctrs, counts, width=0.8, bottom=bottoms, color=_COLOURS[g], alpha=0.85,
+               label=labels[g], edgecolor='white', linewidth=0.3)
+        bottoms += counts
+    _mark_quartiles(ax, dvq1, dvq2, dvq3, '.1f')
+    _apply_paper_style(
+        ax,
+        f'発話あたりの無声化トークン数の分布\n（無声化なし：発話の{zero_pct:.1f}%）',
+        '無声化トークン数', '発話数',
     )
-    plt.tight_layout()
+    _legend_groups_then_quartiles(ax)
 
-    if save_path is not None:
-        Path(save_path).parent.mkdir(parents=True, exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f'Plot saved → {save_path}')
-    plt.show()
+    fig.tight_layout()
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(save_path, dpi=_PLOT_DPI, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Plot saved → {save_path}')
+
+
+def plot_distributions(df: pd.DataFrame, save_dir: Path | None = None) -> None:
+    """Three standalone charts (phone length / audio duration / devoiced token
+    count per utterance, each strata-coloured), written as separate PNGs to
+    ``save_dir`` (default: img/) rather than one multi-panel figure."""
+    save_dir = Path(save_dir) if save_dir is not None else DEFAULT_IMG_DIR
+    plot_phone_length(df, save_dir / 'stratified_distribution_phone_length.png')
+    plot_audio_duration(df, save_dir / 'stratified_distribution_audio_duration.png')
+    plot_devoicing_count(df, save_dir / 'stratified_distribution_devoicing_count.png')
 
 
 # ── Public bridge: imported by train_p.py and train.py ───────────────────────
@@ -398,16 +471,17 @@ if __name__ == '__main__':
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument('--data-dir', default=str(DATA_DIR),
-                        help='Dir with transcript_phone.txt & transcript_romaji.txt')
+                        help='Dir with transcript_phone3_rev.txt')
     parser.add_argument('--wav-dir',  default=str(WAV_DIR),
                         help='Dir containing BASIC5000_XXXX.wav files')
     parser.add_argument('--out',      default=str(DEFAULT_MANIFEST),
                         help='Output path for stratified_manifest.csv')
     parser.add_argument('--seed',     type=int, default=SEED)
     parser.add_argument('--plot',     action='store_true',
-                        help='Save three-panel distribution plot to img/')
-    parser.add_argument('--plot-out', default=None,
-                        help='PNG save path (default: img/stratified_distribution.png)')
+                        help='Save phone-length / audio-duration / devoicing-count '
+                             'distribution charts (3 separate PNGs) to img/')
+    parser.add_argument('--plot-dir', default=None,
+                        help='Directory for the 3 PNGs (default: img/)')
     args = parser.parse_args()
 
     df = build_manifest(
@@ -424,9 +498,5 @@ if __name__ == '__main__':
     print_report(df)
 
     if args.plot:
-        plot_out = (
-            Path(args.plot_out)
-            if args.plot_out
-            else DEFAULT_IMG_DIR / 'stratified_distribution.png'
-        )
-        plot_distributions(df, save_path=plot_out)
+        plot_dir = Path(args.plot_dir) if args.plot_dir else DEFAULT_IMG_DIR
+        plot_distributions(df, save_dir=plot_dir)

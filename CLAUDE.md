@@ -7,8 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Japanese ASR that outputs **explicit vowel-devoicing tokens**. A Conformer-encoder /
 Transformer-decoder seq2seq model trained on JSUT basic5000, using `phone_level3`-style
 transcripts where devoiced high vowels are upper-cased (e.g. `s U k i`). Recognition and
-devoicing detection happen in a single pass. Best config (bs8 lr1e-3): PER 2.35%,
-devoicing F1 97.23% — see `doc/results.md`.
+devoicing detection happen in a single pass. Best config (bs8 lr1e-3, dw5): PER 2.61%,
+devoicing F1 93.26% — see `results.md`.
 
 ## Setup
 
@@ -80,8 +80,13 @@ the other in sync.
 - **Audio**: 16 kHz → 80-mel log-spectrogram, n_fft=1024, hop=256, `MAX_FRAMES=1024`,
   `MAX_TOKENS=256` (fixed-shape padding per batch so cudnn autotuning stays effective)
 
-Checkpoints: `models/train_phone3_<YYYYMMDD_HHMM>_bs{BS}_lr{LR}_ks19_do0.1_stratified.pt`,
+Checkpoints: `models/train_phone3_<YYYYMMDD_HHMM>_bs{BS}_lr{LR}_ks19_do0.1_stratified.pt`
+(sweep runs via `scripts/sweep_runner.py` insert `_dw{DEVO_WEIGHT}` before `_stratified`),
 tracked with **git-lfs**. Each training run also appends a row to `doc/results_phone3.csv`.
+The checkpoint(s) published for public use are manually renamed to a stable,
+date-free name (`model_bs{BS}_lr{LR}_dw{DW}.pt`) after training — checkpoint
+globs across the repo (`gradio_demo.py`, `inference_r3.py`, `eval_phone3_testset.py`)
+match `*.pt` so both naming schemes work.
 
 ### phone_level3 / devoicing convention
 
@@ -137,6 +142,10 @@ entry-point scripts. Import as `from scripts.phone_tokenizer import ...`.
 | `gradio_demo_r.py` | Shared Gradio UI helpers (plots, playhead) |
 | `audio.py` | Pitch / RMS extraction for demo plots |
 | `make_transcript_phone3_rev.py` | Preprocessing: `basic5000.yaml` → phone3 transcript + vocab |
+| `apply_manual_corrections.py` | Propagates reviewed rows from the manual-check xlsx into transcript `.txt` files |
+| `analyze_devoicing_ojt.py` | Devoicing distribution/frequency stats over `transcript_phone3_rev.txt` |
+| `plot_devoicing_ojt.py` | Renders the CSVs/JSON from `analyze_devoicing_ojt.py` as standalone charts |
+| `sweep_runner.py` | Per-GPU sequential runner + hang watchdog for the BS×LR×DW training sweep |
 
 ## Repository layout
 
@@ -144,9 +153,10 @@ entry-point scripts. Import as `from scripts.phone_tokenizer import ...`.
 train_r3.py               training entrypoint (phone3, stratified split)
 inference_r3.py           CLI inference + devoicing evaluation
 eval_phone3_testset.py    batch test-set evaluation over checkpoints
-gradio_demo.py            browser demo (record / pick JSUT wav, 2 checkpoints)
+gradio_demo.py            browser demo (record / pick JSUT wav)
+results.md                results tables
 models/                   trained weights (git-lfs)
-doc/                      results tables + tokenizer vocabularies
+doc/                      tokenizer vocabularies + run notes
 img/                      confusion matrices, distributions, architecture diagrams
 dataset/jsut_ver1.1/basic5000/
   wav/                    EMPTY — download JSUT and place the 5000 wavs here

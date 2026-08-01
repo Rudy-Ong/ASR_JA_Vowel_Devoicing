@@ -54,6 +54,12 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else
 # pays off without re-benchmarking per batch.
 torch.backends.cudnn.benchmark = True
 
+# This machine runs several training jobs (ours + other users') across the
+# same GPUs/cores at once; torch defaults to one intra-op thread per core,
+# which oversubscribes the box and makes iteration time jittery. Cap it.
+torch.set_num_threads(int(os.environ.get('TORCH_NUM_THREADS', '6')))
+torch.set_num_interop_threads(1)
+
 # Optional: allow TF32 matmuls (Ampere+).  Off by default to keep numerics
 # identical to the published runs; enable with ALLOW_TF32=1.  (Conv layers
 # already use TF32 by default via cudnn — this flag only affects matmuls.)
@@ -84,7 +90,7 @@ BATCH_SIZE   = int(os.environ.get('SWEEP_BATCH_SIZE', 16))
 NUM_EPOCHS   = 100
 LR           = float(os.environ.get('SWEEP_LR', 1e-3))
 WEIGHT_DECAY = 1e-2
-RESUME_FROM  = None
+RESUME_FROM  = os.environ.get('RESUME_FROM')
 
 # ── Model config ──────────────────────────────────────────────────────────────
 D_MODEL      = 256
@@ -94,7 +100,7 @@ N_DEC_LAYERS = 2
 FF_DIM       = 1024
 DROPOUT      = 0.1
 KERNEL_SIZE  = 19
-DEVO_WEIGHT  = 5.0
+DEVO_WEIGHT  = float(os.environ.get('SWEEP_DEVO_WEIGHT', 5))
 
 # Optional: mask zero-padded mel frames out of the encoder self-attention.
 # Off by default so runs reproduce the published pipeline exactly; set
@@ -182,7 +188,8 @@ class JSUTDataset(Dataset):
 def make_loader(utt_ids, shuffle=False):
     ds = JSUTDataset(utt_ids, romaji_transcripts, WAV_DIR, tokenizer)
     return DataLoader(ds, batch_size=BATCH_SIZE, shuffle=shuffle,
-                      num_workers=4, pin_memory=(DEVICE.type == 'cuda'))
+                      num_workers=2, pin_memory=(DEVICE.type == 'cuda'),
+                      persistent_workers=True, prefetch_factor=2)
 
 train_loader = make_loader(train_ids, shuffle=True)
 val_loader   = make_loader(val_ids)
@@ -688,7 +695,8 @@ def eval_epoch(model, loader, criterion):
 
 # ── 10. tmux pane + log file ──────────────────────────────────────────────────
 RUN_TAG    = datetime.datetime.now().strftime('%Y%m%d_%H%M')
-model_name = f'train_phone3_{RUN_TAG}_bs{BATCH_SIZE}_lr{LR}_ks{KERNEL_SIZE}_do{DROPOUT}_stratified'
+NAME_SUFFIX = os.environ.get('SWEEP_NAME_SUFFIX', 'stratified')
+model_name = f'train_phone3_{RUN_TAG}_bs{BATCH_SIZE}_lr{LR}_ks{KERNEL_SIZE}_do{DROPOUT}' + (f'_{NAME_SUFFIX}' if NAME_SUFFIX else '')
 
 wandb.init(
     project='ja_devoicing_asr',
@@ -807,22 +815,30 @@ for epoch in range(start_epoch, NUM_EPOCHS + 1):
         }, ckpt_path)
         log(f'  → Saved best checkpoint: {ckpt_path.name}')
 
+_test_ckpt_path = MODEL_DIR / f'{model_name}.pt'
+if not _test_ckpt_path.exists():
+    _test_ckpt_path = _resume_path
+    log(f'No new best checkpoint saved this run; using {_test_ckpt_path.name} for test eval.')
+
 log('\nTraining complete.')
 _log_file.close()
 wandb.finish()
 
 
 # ── 13. Test Evaluation ───────────────────────────────────────────────────────
-_test_ckpt_path = MODEL_DIR / f'{model_name}.pt'
-if not _test_ckpt_path.exists():
-    _test_ckpt_path = _resume_path
-    log(f'No new best checkpoint saved this run; using {_test_ckpt_path.name} for test eval.')
 ckpt = torch.load(_test_ckpt_path, map_location=DEVICE)
 _m   = model.module if isinstance(model, nn.DataParallel) else model
 _state = ckpt['model_state']
 if any(k.startswith('module.') for k in _state):
     _state = {k.removeprefix('module.'): v for k, v in _state.items()}
 _m.load_state_dict(_state)
+
+if best_val_result is None:
+    # RESUME_FROM a checkpoint whose epoch was never beaten this run (no new
+    # best found) — best_val_result was never populated, so the val split
+    # never gets a CSV row. Re-evaluate val with the checkpoint actually used
+    # for test, so its real validation numbers still get recorded.
+    best_val_result = {'epoch': ckpt['epoch'], **eval_epoch(model, val_loader, criterion)}
 
 tm = eval_epoch(model, test_loader, criterion)
 test_per = tm['per']
@@ -866,14 +882,22 @@ all_rows.append(_row('test', ckpt['epoch'], tm, 5))
 fieldnames = ['model_name', 'date', 'split', 'epoch', 'PER', 'KER',
               'devo_P', 'devo_R', 'devo_F1', 'TP', 'FP', 'FN',
               'CCDA', 'CCDA_correct', 'DEO', 'DEO_correct', 'devo_total']
-write_header = not csv_path.exists()
+if csv_path.exists():
+    with open(csv_path, newline='', encoding='utf-8') as f:
+        existing_header = next(csv.reader(f), [])
+    write_header = existing_header != fieldnames
+else:
+    write_header = True
 with open(csv_path, 'a', newline='', encoding='utf-8') as f:
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     if write_header:
         writer.writeheader()
     writer.writerows(all_rows)
 print(f'Results saved → {csv_path}')
-print(pd.read_csv(csv_path).tail(5).to_string(index=False))
+try:
+    print(pd.read_csv(csv_path).tail(5).to_string(index=False))
+except Exception as e:
+    print(f'(skipping results preview, could not read {csv_path}: {e})')
 
 
 # ── 15. Quick Inference Demo ──────────────────────────────────────────────────

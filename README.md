@@ -6,11 +6,11 @@ basic5000 with `phone_level3`-style transcripts in which devoiced high vowels
 are upper-cased (`s U k i` → し is devoiced), so recognition and devoicing
 detection happen in a single pass.
 
-Best configuration (see [doc/results.md](doc/results.md)): bs8 lr1e-3 —
-**PER 2.35 %** (phone error rate; reported as "CER" before 2026-07-29),
-devoicing detection **F1 97.23 %**. Character-level accuracy is reported
-separately as **KER** (kana error rate — a character error rate over the
-kana rendering of the phone3 output, punctuation excluded; see
+Best configuration (see [results.md](results.md)): bs8 lr1e-3 dw5 —
+**PER 2.61 %** (phone error rate; reported as "CER" before 2026-07-29),
+devoicing detection **F1 93.26 %**, **CCDA 93.40 %**. Character-level accuracy
+is reported separately as **KER** (kana error rate — a character error rate
+over the kana rendering of the phone3 output, punctuation excluded; see
 `scripts/kana.py`, conventions follow
 [nyosegawa/hiragana-asr](https://github.com/nyosegawa/hiragana-asr)).
 
@@ -30,14 +30,13 @@ scripts/                  internal library + task scripts
   gradio_demo_r.py          shared demo UI helpers (plots, playhead)
   make_transcript_phone3_rev.py   preprocessing: basic5000.yaml → transcript + vocab
 models/                   trained weights (git-lfs)
-  train_phone3_..._bs8_lr0.001_..._stratified.pt    (phone3_bs8_lr0.001)
-  train_phone3_..._bs32_lr0.001_..._stratified.pt   (phone3_bs32_lr0.001)
-doc/                      results tables + tokenizer vocabularies
+  model_bs8_lr1e-3_dw5.pt   (shipped checkpoint: bs8, lr1e-3, devo_weight=5)
+results.md                results tables
+doc/                      tokenizer vocabularies + run notes
 img/                      confusion matrices, distributions, architecture diagrams
 dataset/jsut_ver1.1/basic5000/
   wav/                    ← EMPTY: download JSUT and place the 5000 wavs here
   transcript_phone3_rev.txt      training/eval transcript (devoiced I/U)
-  transcript_phone3_ojt.txt      OJT-annotated reference transcript
   transcript_utf8_rev.txt        revised surface-text transcript (demo display)
   stratified_manifest.csv        train/val/test split manifest
   train_paths.txt / val_paths.txt / test_paths.txt
@@ -81,17 +80,6 @@ python scripts/make_transcript_phone3_rev.py
 Writes `dataset/.../transcript_phone3_rev.txt` and
 `doc/tokenizer_romaji_rev_vocab.json`.
 
-> ⚠️ The committed `transcript_phone3_rev.txt` carries a handful of manual
-> corrections (5 utterances, e.g. BASIC5000_0047) on top of the rule-based
-> output. Re-running the script overwrites them — use
-> `git checkout dataset/.../transcript_phone3_rev.txt` to restore, or pass an
-> alternative `--dst`. The stratified split manifest can **not** be rebuilt
-> exactly: `scripts/stratified_sampling.py` also needs `transcript_phone.txt`
-> and `transcript_romaji.txt` (from the older r1 pipeline), which are not
-> committed, and regenerating from the phone3 transcripts would produce a
-> *different* split. Treat the committed `stratified_manifest.csv` as
-> authoritative for reproducing the published numbers.
-
 ### 2. Training
 
 ```bash
@@ -101,21 +89,21 @@ python train_r3.py
 - Logs to [Weights & Biases](https://wandb.ai): run `wandb login` first, or
   set `WANDB_MODE=offline` (an `.env` file with `WANDB_API_KEY=…` at the repo
   root is also picked up).
-- Edit the `BS` / `LR` constants in `train_r3.py` for the sweep grid; each run
-  saves `models/train_phone3_<date>_bs{BS}_lr{LR}_ks19_do0.1_stratified.pt`
+- Edit the `BS` / `LR` / `DEVO_WEIGHT` constants in `train_r3.py` for the sweep grid; each run
+  saves `models/train_phone3_<date>_bs{BS}_lr{LR}_dw{DEVO_WEIGHT}_stratified.pt`
   and appends to `doc/results_phone3.csv`.
 
 ### 3. Inference
 
 ```bash
 # single / multiple files
-python inference_r3.py path/to/audio.wav --checkpoint models/train_phone3_20260624_0429_bs8_lr0.001_ks19_do0.1_stratified.pt
+python inference_r3.py path/to/audio.wav --checkpoint models/model_bs8_lr1e-3_dw5.pt
 
 # JSUT test split + devoicing confusion matrix (needs the wavs)
 python inference_r3.py --eval-scope test
 ```
 
-Without `--checkpoint` the newest `models/train_phone3_*.pt` is used.
+Without `--checkpoint` the newest `models/*.pt` is used.
 
 ### 4. Test-set evaluation over all checkpoints
 
@@ -131,10 +119,10 @@ Confusion-matrix PNGs go to `img/`, tables to `doc/`.
 python gradio_demo.py
 ```
 
-Record from the microphone or pick a JSUT wav, choose one of the two shipped
-checkpoints (`bs8_lr0.001` / `bs32_lr0.001`) in the dropdown, and get the
-phone3 transcript with devoiced vowels highlighted plus mel / pitch / RMS
-plots. Launches with `share=True` (public gradio link).
+Record from the microphone or pick a JSUT wav, choose the shipped checkpoint
+(`model_bs8_lr1e-3_dw5`, or any other `*.pt` you've trained locally) in the
+dropdown, and get the phone3 transcript with devoiced vowels highlighted plus
+mel / pitch / RMS plots. Launches with `share=True` (public gradio link).
 
 ## Model
 
@@ -146,11 +134,35 @@ plots. Launches with `share=True` (public gradio link).
 | Audio | 16 kHz, 80 mel, n_fft 1024, hop 256 |
 | Tokens | phone3 vocab (`doc/tokenizer_romaji_rev_vocab.json`), devoiced `I`/`U` |
 
-Architecture diagram: [img/model_architecture.svg](img/model_architecture.svg)
+![Model architecture](img/model.png)
+
+PER alone doesn't tell you whether devoicing was scored correctly — a low PER can still hide wrong devoicing context (CCDA). See `results.md` for the full metric definitions:
+
+![PER vs CCDA scoring example](img/per_ccda_metrics.png)
+PER score by predicting all phonemes produced by ASR and compare to ground truth. But, vowel devoicing occurs in specific phonological contexts. This context oftenly occur when vowel (i, u) is preceded and followed by a voiceless consonant. Therefore, aside of PER, we need CCDA (Context-Conditioned Devoicing Accuracy) as a local window to measure whether the devoiced vowel is in the correct context. CCDA is computed by checking if the devoiced vowel mark detected, they will extract three-phonemes  as set compare with ground truth's set.
+## Example
+
+```bash
+python inference_r3.py dataset/jsut_ver1.1/basic5000/wav/BASIC5000_0001.wav --checkpoint models/model_bs8_lr1e-3_dw5.pt
+```
+
+```
+Loaded checkpoint: model_bs8_lr1e-3_dw5.pt
+  epoch=99  test_PER=2.61%  KER=3.42%  CCDA=93.40%  cmvn=False  device=cuda
+
+Transcript
+BASIC5000_0001: 水をマレーシアから買わなくてはならないのです。
+
+Prediction
+BASIC5000_0001: m i z u o m a r e e sh i a k a r a k a w a n a k [U] t e w a n a r a n a i n o d e s [U]
+devoicing C1·[V]·C2: k·[U]·t, s·[U]·<eos>
+```
+
+Vowel devoicing is marked with upper-case `I` for voiceless "i" or `U` for voiceless "u" in the transcript.
 
 ## Publishing to GitHub
 
-The two checkpoints (~96 MB each) are tracked with **git-lfs**:
+The shipped checkpoint (~96 MB) is tracked with **git-lfs**:
 
 ```bash
 git lfs install
