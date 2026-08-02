@@ -6,12 +6,9 @@ basic5000 with `phone_level3`-style transcripts in which devoiced high vowels
 are upper-cased (`s U k i` → し is devoiced), so recognition and devoicing
 detection happen in a single pass.
 
-Best configuration (see [results.md](results.md)): bs8 lr1e-3 dw5 —
-**PER 2.61 %** (phone error rate; reported as "CER" before 2026-07-29),
-devoicing detection **F1 93.26 %**, **CCDA 93.40 %**. Character-level accuracy
-is reported separately as **KER** (kana error rate — a character error rate
-over the kana rendering of the phone3 output, punctuation excluded; see
-`scripts/kana.py`, conventions follow
+Best configuration and other variation of parameter shown in ( [results.md](results.md)) 
+Add **KER** as Character-level accuracy in results' table. The kana rendering method
+execute in `scripts/kana.py`, take reference from
 [nyosegawa/hiragana-asr](https://github.com/nyosegawa/hiragana-asr)).
 
 ## Repository layout
