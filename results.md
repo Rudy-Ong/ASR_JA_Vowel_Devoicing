@@ -44,3 +44,24 @@ completed run) is in `doc/archive/results_20260802.md`.
   unconfirmed from a single run — the same flag made the 2026-08-02 DW5 rerun
   noticeably *worse* (PER 3.27% vs. this table's 2.61%), so treat TF32 as an open
   variable, not a settled improvement. See `doc/archive/results_20260802.md`.
+
+## Aug 2 batch: DW1 vs DW5 (same-day comparison)
+
+Both runs below are BS8/LR1e-3, `ENC_PADDING_MASK=1`, `ALLOW_TF32=1`, best checkpoint at
+epoch 85 — the only pair in this doc that isolates DW1 vs DW5 under identical flags on
+the same day. DW5 ran DataParallel across all 4 GPUs (unpinned); DW1 was pinned to a
+single GPU.
+
+| run (start) | config | PER ↓ (%) | KER ↓ (%) | Precision ↑ (%) | Recall ↑ (%) | F1 ↑ (%) | CCDA ↑ (%) | DEO ↑ (%) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 2026-08-02 04:40 | DW1 | **2.65** | **3.42** | **91.79** | 93.40 | 92.59 | 92.45 | 94.34 |
+| 2026-08-02 04:27 | DW5 | 3.27 | 4.19 | 90.27 | **95.01** | 92.58 | **93.53** | **96.23** |
+
+- DW1 wins cleanly on PER (by 0.62pp), KER (0.77pp), and Precision; DW5 wins on Recall,
+  CCDA, and DEO; F1 is a dead heat (92.59 vs 92.58).
+- This is the opposite split from the main sweep table above, where the headline DW5
+  row beats DW1 on every metric — because that headline DW5 number (PER 2.61%) comes
+  from the clean 07-31 run, not this noisier Aug-2 rerun (PER 3.27%). Read this
+  comparison as "DW1 tolerated the TF32/DataParallel conditions better than DW5 did
+  that morning," not as evidence that DW1 beats DW5 in general — it doesn't overturn
+  the "Best overall: DW5" conclusion above, which rests on the cleaner runs.
